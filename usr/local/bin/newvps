@@ -1,0 +1,37 @@
+#!/bin/bash
+#======================================================================
+# FILE:
+#   newvps
+#
+# VERSION:
+#   Mar 22, 2016 / t4lwh
+#======================================================================
+
+if [ 'root' != `id -un` ]
+then
+    echo "Please run this script as root" >&2
+    exit 1
+fi
+
+ERROR=
+
+# default start
+DEBIAN_FRONTEND=noninteractive apt-get install -qqf nginx mysql-server php5-fpm php5-mysql || ERROR=1
+curl -LSso /etc/nginx/nginx.conf "https://raw.githubusercontent.com/t4lwh/vps/master/etc/nginx/nginx.conf" || ERROR=1
+rm /etc/nginx/sites-enabled/default 2>/dev/null
+systemctl restart nginx
+
+# site mgmt tool
+curl -LSso /usr/local/bin/site "https://raw.githubusercontent.com/t4lwh/vps/master/usr/local/bin/site" || ERROR=1
+chmod +x /usr/local/bin/site
+
+# default sshd port
+#sed -i /etc/ssh/sshd_config -e 's/^Port 22$/Port 2016/'
+systemctl restart ssh
+
+# default vps
+[ "$0" == "/usr/local/bin/newvps" ] || cp $0 /usr/local/bin/newvps
+chmod +x /usr/local/bin/newvps
+
+# 
+[ $ERROR ] || echo "VPS updated"

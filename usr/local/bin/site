@@ -1,0 +1,312 @@
+#!/bin/bash
+#======================================================================
+# FILE:
+#   site
+#
+# VERSION:
+#   Mar 23, 2016/ t4lwh
+#======================================================================
+
+#----------------------------------------
+# common
+#----------------------------------------
+# exit 1
+if [ 'root' != `id -un` ]
+then
+    echo "Please run this script as root" >&2
+    exit 1
+fi
+
+ACTION=$1
+SITE=$2
+
+# wordpress var
+WP_DIR=/srv/wordpress
+WP_LATEST="https://wordpress.org/latest.tar.gz"
+WP_BACKUP=/srv/backup/${SITE}.tar.gz
+
+# mysql var
+DB_NAME=${SITE//[.-]/_}
+DB_PASS=
+DB_USERNAME=${SITE//[.-]/_}
+DB_USERPASS=$(openssl rand -hex 16)
+DB_BACKUP=/srv/backup/${SITE}.sql.gz
+
+# nginx var
+NX_AVAIL=/etc/nginx/sites-available
+NX_ENABLE=/etc/nginx/sites-enabled
+NX_BACKUP=/srv/backup/${SITE}.nginx
+
+#----------------------------------------
+# routine
+#----------------------------------------
+# usage: exit 2
+usage() {
+    echo $@
+    echo
+    echo "Usage: $0 {addnew|destroy|backup|restore} example.com"
+    echo
+    exit 2
+}
+
+# wordpress: exit 3
+add_wp_dir() {
+    if [ -e "$WP_DIR/$SITE" ]
+    then
+        echo "Wordpress ($WP_DIR/$SITE) exists, please remove first!"
+        exit 3
+    else
+        echo "Creating $WP_DIR/$SITE ..."
+        mkdir -m 0755 -p $WP_DIR/$SITE
+        echo "Downloading latest wordpress $WP_LATEST ..."
+        wget -qO- "${WP_LATEST}" | tar xzf - --strip-components=1 -C ${WP_DIR}/${SITE}
+        echo "Updating Wordpress config ($WP_DIR/$SITE/wp-config.php) ..."
+        cp $WP_DIR/$SITE/wp-config-sample.php $WP_DIR/$SITE/wp-config.php
+        chown -R www-data:www-data $WP_DIR/$SITE
+        for key in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT
+        do
+            RAND=$(openssl rand -hex 32)
+            sed -i -e "/'$key'/s/put your unique phrase here/$RAND/" $WP_DIR/$SITE/wp-config.php
+        done
+    fi
+
+}
+del_wp_dir() {
+    # always nice to have a buffer to false action
+    TMP=/tmp/${SITE}_$$.wordpress
+
+    echo "Removing $WP_DIR/$SITE ..."
+    mv $WP_DIR/$SITE $TMP 2>/dev/null
+}
+bak_wp_dir() {
+    if [ ! -e "$WP_DIR/$SITE" ]
+    then
+        echo "Wordpress ($WP_DIR/$SITE) does not exist, nothing to backup"
+    else
+        echo "Backup $WP_DIR/$SITE ..."
+        [ -e "$(dirname $WP_BACKUP)" ] || mkdir -m 0755 -p "$(dirname $WP_BACKUP)"
+        # try to follow official wordpress release structure. one root leading directory
+        tar czf $WP_BACKUP -C $WP_DIR $SITE --owner=www-data --group=www-data
+    fi
+}
+res_wp_dir() {
+    if [ -e "$WP_DIR/$SITE" ]
+    then
+        echo "Wordpress ($WP_DIR/$SITE) exists, not overriding. Please remove first!"
+        exit 3
+    elif [ ! -e "$WP_BACKUP" ]
+    then
+        echo "Wordpress backup ($WP_BACKUP) does not exist, nothing to restore!"
+        exit 3
+    else
+        echo "Creating $WP_DIR/$SITE ... "
+        mkdir -m 0755 -p ${WP_DIR}/${SITE}
+        echo "Restroing wordpress from $WP_BACKUP ..."
+        tar xzf $WP_BACKUP --strip-components=1 -C ${WP_DIR}/${SITE}
+        chown -R www-data:www-data $WP_DIR/$SITE
+    fi
+}
+
+# mysql: exit 4
+add_mysql_db() {
+    read -e -s -p "Please enter MySQL root password: " DB_PASS && echo
+
+    if mysql -h localhost -u root --password=$DB_PASS -e "use $DB_NAME" 2> /dev/null
+    then
+        echo "Database ($DB_NAME) exists, please drop it first!"
+        exit 4
+    else
+        echo "Creating new database ($DB_NAME) for user ($DB_USERNAME) ..."
+
+        mysql -h localhost -u root --password=$DB_PASS <<EOF
+flush privileges;
+create database $DB_NAME;
+grant all privileges on ${DB_NAME}.* to '$DB_USERNAME'@'localhost' identified by '$DB_USERPASS';
+flush privileges;
+EOF
+
+        echo "Updating DB info in Wordpress ($WP_DIR/$SITE/wp-config.php) ..."
+        sed -i -e "/DB_HOST/s/'DB_HOST',\s*'.*'/'DB_HOST','localhost'/" $WP_DIR/$SITE/wp-config.php
+        sed -i -e "/DB_NAME/s/'DB_NAME',\s*'.*'/'DB_NAME','$DB_NAME'/" $WP_DIR/$SITE/wp-config.php
+        sed -i -e "/DB_USER/s/'DB_USER',\s*'.*'/'DB_USER','$DB_USERNAME'/" $WP_DIR/$SITE/wp-config.php
+        sed -i -e "/DB_PASSWORD/s/'DB_PASSWORD',\s*'.*'/'DB_PASSWORD','$DB_USERPASS'/" $WP_DIR/$SITE/wp-config.php
+    fi
+}
+del_mysql_db() {
+    read -e -s -p "Please enter MySQL root password: " DB_PASS && echo
+
+    # always nice to have a buffer to false action
+    TMP=/tmp/${SITE}_$$.mysql
+
+    echo "Removing database ($DB_NAME) with user ($DB_USERNAME) ..."
+    mysqldump -h localhost -u root --password=$DB_PASS $DB_NAME > $TMP 2>/dev/null
+    mysql -h localhost -u root --password=$DB_PASS <<EOF
+flush privileges;
+drop database if exists $DB_NAME;
+grant usage on *.* to '$DB_USERNAME'@'localhost';
+drop user '$DB_USERNAME'@'localhost';
+flush privileges;
+EOF
+}
+bak_mysql_db() {
+    read -e -s -p "Please enter MySQL root password: " DB_PASS && echo
+
+    if ! mysql -h localhost -u root --password=$DB_PASS -e "use $DB_NAME" 2> /dev/null
+    then
+        echo "Database ($DB_NAME) does not exists, nothing to backup."
+    else
+        echo "Backup database ($DB_NAME) ..."
+        mysqldump -h localhost -u root --password=$DB_PASS $DB_NAME | gzip > $DB_BACKUP
+    fi
+}
+res_mysql_db() {
+    read -e -s -p "Please enter MySQL root password: " DB_PASS && echo
+
+    if mysql -h localhost -u root --password=$DB_PASS -e "use $DB_NAME" 2> /dev/null
+    then
+        echo "Database ($DB_NAME) exist, not overriding. Please drop it first!"
+        exit 4
+    elif [ ! -e "$DB_BACKUP" ]
+    then
+        echo "Database backup ($DB_BACKUP) does not exist. nothing to restore!"
+        exit 4
+    else
+        echo "Creating new database ($DB_NAME) for user ($DB_USERNAME) ..."
+        mysql -h localhost -u root --password=$DB_PASS <<EOF
+flush privileges;
+create database $DB_NAME;
+grant all privileges on ${DB_NAME}.* to $DB_USERNAME@localhost identified by '$DB_USERPASS';
+flush privileges;
+EOF
+        sed -i -e "/DB_HOST/s/'DB_HOST',\s*'.*'/'DB_HOST','localhost'/" $WP_DIR/$SITE/wp-config.php
+        sed -i -e "/DB_NAME/s/'DB_NAME',\s*'.*'/'DB_NAME','$DB_NAME'/" $WP_DIR/$SITE/wp-config.php
+        sed -i -e "/DB_USER/s/'DB_USER',\s*'.*'/'DB_USER','$DB_USERNAME'/" $WP_DIR/$SITE/wp-config.php
+        sed -i -e "/DB_PASSWORD/s/'DB_PASSWORD',\s*'.*'/'DB_PASSWORD','$DB_USERPASS'/" $WP_DIR/$SITE/wp-config.php
+
+        echo "Restroing database from $DB_BACKUP ..."
+        zcat $DB_BACKUP | mysql -h localhost -u root --password=$DB_PASS $DB_NAME
+
+    fi
+}
+
+# nginx: exit 5
+add_nginx_site() {
+    if [ -e ${NX_ENABLE}/${SITE} ]
+    then
+        echo "Nginx site ($NX_ENABLE/$SITE) exists, please remove first!"
+        exit 5
+    else
+        echo "Creating new Nginx site ($SITE) ..."
+        curl -LSso ${NX_AVAIL}/${SITE} "https://raw.githubusercontent.com/t4lwh/vps/master/etc/nginx/sites-available/wordpress"
+        sed -i ${NX_AVAIL}/${SITE} -e "s/example.com/$SITE/g"
+        ln -sf ${NX_AVAIL}/${SITE} ${NX_ENABLE}/${SITE}
+    fi
+}
+del_nginx_site() {
+    # always nice to have a buffer to false action
+    TMP=/tmp/${SITE}_$$.nginx
+
+    echo "Removing Nginx site ($SITE) ..."
+    # in fact, just disable it. file still in sites-available
+    cp -L ${NX_ENABLE}/${SITE} $TMP 2>/dev/null || cp ${NX_AVAIL}/${SITE} $TMP 2>/dev/null
+    rm ${NX_ENABLE}/${SITE} 2>/dev/null
+}
+bak_nginx_site() {
+    if [ ! -e ${NX_ENABLE}/${SITE} ] && [ ! -e ${NX_AVAIL}/${SITE} ]
+    then
+        echo "Nginx site, neither $NX_ENABLE/$SITE nor $NX_AVAIL/$SITE exists, nothing to backup"
+    else
+        echo "Backup Nginx site ($SITE) ..."
+        cp -L ${NX_ENABLE}/${SITE} $NX_BACKUP 2>/dev/null || cp ${NX_AVAIL}/${SITE} $NX_BACKUP 2>/dev/null
+    fi
+}
+res_nginx_site() {
+    if [ -e ${NX_ENABLE}/${SITE} ]
+    then
+        echo "Nginx site ($NX_ENABLE/$SITE) exists, not overriding. Please remove first!"
+        exit 5
+    elif [ ! -e "$NX_BACKUP" ]
+    then
+        echo "Nginx site backup ($NX_BACKUP) does not exist. Will use default setting"
+        add_nginx_site
+    else
+        echo "Restoring Nginx site from $NX_BACKUP ..."
+        cp $NX_BACKUP $NX_AVAIL/$SITE
+        ln -sf $NX_AVAIL/$SITE $NX_ENABLE/$SITE
+    fi
+}
+
+# show_info: exit 0
+show_info() {
+    # reload nginx first
+    if systemctl is-active nginx >/dev/null
+    then
+        nginx -s reload
+    else
+        systemctl restart nginx
+    fi
+
+    echo
+    echo "$@"
+    echo 
+
+}
+
+#----------------------------------------
+# action
+#----------------------------------------
+# check valid domain name
+[ "${SITE}" == "" ] && usage "Invalid domain name"
+[ "${SITE##-}" != "$SITE" ] && usage "Invalid domain name"
+[ "${SITE//[a-zA-Z0-9-.]/}" != "" ] && usage "Invalid domain name"
+
+IPv4=$(ip add show eth0 | sed -nre 's:^.*inet (.*)/.* brd .*$:\1:p')
+case "$ACTION" in
+    addnew)
+        add_wp_dir
+        add_mysql_db
+        add_nginx_site
+        show_info "
+Now open browser to complete installation, using one of following methods
+    * If domain name $SITE not yet map to $IPv4, goto http://$IPv4/$SITE
+    * If domain name $SITE already map to $IPv4, goto http://$SITE
+    * for testing purpose, you can modify local etc hosts, map $SITE to $IPv4, then goto http://$SITE
+"
+        ;;
+    destroy)
+        del_wp_dir
+        del_mysql_db
+        del_nginx_site
+        show_info "
+$SITE has been destroyed. Temp files are kept in /tmp in case false action
+"
+        ;;
+    backup)
+        bak_wp_dir
+        bak_mysql_db
+        bak_nginx_site
+        show_info "
+$SITE has been backed up. Copying following files to your backup media
+    Wodpress: $WP_BACKUP
+    MySQL: $DB_BACKUP 
+    Nginx: $NX_BACKUP (optional unless you have special config)
+"
+        ;;
+    restore)
+        res_wp_dir
+        res_mysql_db
+        res_nginx_site
+        show_info "
+Now open browser to verify $SITE has been successfully restored, using one of following methods
+    * If $SITE not yet map to $IPv4, goto http://$IPv4/$SITE
+    * If $SITE already map to $IPv4, goto http://$SITE
+    * For testing purpose, modify local etc hosts, map $SITE to $IPv4, 
+        then goto http://$SITE  (useful if in page links are pionted to $SITE)
+
+NOTE: about image uploads, if you have plugins setting for a different upload path, remove it.
+"
+        ;;
+    *)
+        usage "Invalid action: $ACTION"
+        ;;
+esac
